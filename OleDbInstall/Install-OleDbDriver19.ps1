@@ -9,10 +9,15 @@
     3. Microsoft OLE DB Driver 19 for SQL Server (x64)
     
     Both x86 and x64 VC++ Redistributables are required for OLE DB Driver 19.
-    If components are missing, it downloads and installs them in the correct order.
+    If components are missing, it installs them from pre-downloaded files in .\installexe folder.
+    
+    Required files in .\installexe folder (relative to script location):
+    - vc_redist.x64.exe  (from https://aka.ms/vc14/vc_redist.x64.exe)
+    - vc_redist.x86.exe  (from https://aka.ms/vc14/vc_redist.x86.exe)
+    - msoledbsql19.msi   (from https://go.microsoft.com/fwlink/?linkid=2318101)
 
 .PARAMETER DownloadPath
-    Path where installers will be downloaded. Defaults to user's TEMP folder.
+    Path where installation logs will be written. Defaults to user's TEMP folder.
 
 .PARAMETER Force
     Forces reinstallation even if components are already installed.
@@ -43,10 +48,18 @@ param(
 # Log file path (same name as script with .log extension)
 $script:LogFile = $PSCommandPath -replace '\.ps1$', '.log'
 
-# URLs for downloads (permalinks for latest supported versions)
-$VCRedistX64Url = "https://aka.ms/vc14/vc_redist.x64.exe"  # Latest VC++ v14 (14.50.35719.0+)
-$VCRedistX86Url = "https://aka.ms/vc14/vc_redist.x86.exe"  # Latest VC++ v14 (14.50.35719.0+)
-$OleDbUrl = "https://go.microsoft.com/fwlink/?linkid=2318101"  # MSOLEDBSQL19 v19.4.1 (x64/Arm64)
+# Local installer folder path (relative to script location)
+$script:LocalInstallerPath = Join-Path $PSScriptRoot "installexe"
+
+# Expected installer file names
+$script:VCRedistX64File = "vc_redist.x64.exe"
+$script:VCRedistX86File = "vc_redist.x86.exe"
+$script:OleDbFile = "msoledbsql19.msi"
+
+# Download URLs for reference (files must be pre-downloaded to .\installexe folder)
+# $VCRedistX64Url = "https://aka.ms/vc14/vc_redist.x64.exe"  # Latest VC++ v14 (14.50.35719.0+)
+# $VCRedistX86Url = "https://aka.ms/vc14/vc_redist.x86.exe"  # Latest VC++ v14 (14.50.35719.0+)
+# $OleDbUrl = "https://go.microsoft.com/fwlink/?linkid=2318101"  # MSOLEDBSQL19 v19.4.1 (x64/Arm64)
 
 # Minimum required versions
 $MinVCRedistVersion = [Version]"14.34.0.0"  # VS 2022 minimum required for MSOLEDBSQL19 (per 19.3.0 release notes)
@@ -113,6 +126,68 @@ function Write-Status {
     
     # Append to log file with timestamp
     "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') $line" | Add-Content -Path $script:LogFile
+}
+
+function Test-LocalInstallers {
+    <#
+    .SYNOPSIS
+        Validates that all required installer files exist in the local installexe folder
+    .DESCRIPTION
+        Checks for the presence of all required installer files:
+        - vc_redist.x64.exe
+        - vc_redist.x86.exe
+        - msoledbsql19.msi
+        Returns a status object or throws an error if files are missing.
+    #>
+    
+    $result = @{
+        Valid = $true
+        FolderExists = $false
+        FolderPath = $script:LocalInstallerPath
+        Files = @{
+            VCRedistX64 = @{ Required = $script:VCRedistX64File; Exists = $false; FullPath = $null }
+            VCRedistX86 = @{ Required = $script:VCRedistX86File; Exists = $false; FullPath = $null }
+            OleDb = @{ Required = $script:OleDbFile; Exists = $false; FullPath = $null }
+        }
+        MissingFiles = @()
+    }
+    
+    # Check if folder exists
+    if (Test-Path $script:LocalInstallerPath -PathType Container) {
+        $result.FolderExists = $true
+        
+        # Check each required file
+        $vcX64Path = Join-Path $script:LocalInstallerPath $script:VCRedistX64File
+        $vcX86Path = Join-Path $script:LocalInstallerPath $script:VCRedistX86File
+        $oleDbPath = Join-Path $script:LocalInstallerPath $script:OleDbFile
+        
+        if (Test-Path $vcX64Path -PathType Leaf) {
+            $result.Files.VCRedistX64.Exists = $true
+            $result.Files.VCRedistX64.FullPath = $vcX64Path
+        } else {
+            $result.MissingFiles += $script:VCRedistX64File
+        }
+        
+        if (Test-Path $vcX86Path -PathType Leaf) {
+            $result.Files.VCRedistX86.Exists = $true
+            $result.Files.VCRedistX86.FullPath = $vcX86Path
+        } else {
+            $result.MissingFiles += $script:VCRedistX86File
+        }
+        
+        if (Test-Path $oleDbPath -PathType Leaf) {
+            $result.Files.OleDb.Exists = $true
+            $result.Files.OleDb.FullPath = $oleDbPath
+        } else {
+            $result.MissingFiles += $script:OleDbFile
+        }
+    } else {
+        $result.MissingFiles = @($script:VCRedistX64File, $script:VCRedistX86File, $script:OleDbFile)
+    }
+    
+    $result.Valid = ($result.FolderExists -and $result.MissingFiles.Count -eq 0)
+    
+    return [PSCustomObject]$result
 }
 
 function Test-Administrator {
@@ -533,7 +608,8 @@ function Install-VCRedist {
         [int]$RetryDelaySeconds = 30
     )
     
-    $url = if ($Architecture -eq "x64") { $VCRedistX64Url } else { $VCRedistX86Url }
+    $localFileName = if ($Architecture -eq "x64") { $script:VCRedistX64File } else { $script:VCRedistX86File }
+    $localSourcePath = Join-Path $script:LocalInstallerPath $localFileName
     $installerPath = Join-Path $DownloadPath "vc_redist.$Architecture.exe"
     $logPath = Join-Path $DownloadPath "vc_redist_$Architecture.log"
     
@@ -543,16 +619,18 @@ function Install-VCRedist {
         return $false
     }
     
-    Write-Status "Downloading Visual C++ Redistributable 2015-2022 ($Architecture)..." -Type Info
+    Write-Status "Copying Visual C++ Redistributable 2015-2022 ($Architecture) from local folder..." -Type Info
     
     try {
-        # Use TLS 1.2
-        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        # Copy installer from local folder to temp location
+        if (-not (Test-Path $localSourcePath)) {
+            Write-Status "ERROR: Local installer not found: $localSourcePath" -Type Error
+            return $false
+        }
         
-        $webClient = New-Object System.Net.WebClient
-        $webClient.DownloadFile($url, $installerPath)
+        Copy-Item -Path $localSourcePath -Destination $installerPath -Force
         
-        Write-Status "Download complete. Installing ($Architecture)..." -Type Info
+        Write-Status "Installing Visual C++ Redistributable ($Architecture)..." -Type Info
         
         $attempt = 0
         $installSuccess = $false
@@ -632,7 +710,8 @@ function Install-OleDbDriver {
         [int]$RetryDelaySeconds = 30
     )
     
-    $installerPath = Join-Path $DownloadPath "msoledbsql19.msi"
+    $localSourcePath = Join-Path $script:LocalInstallerPath $script:OleDbFile
+    $installerPath = $localSourcePath  # Use directly from local folder (MSI can be run in place)
     $logPath = Join-Path $DownloadPath "msoledbsql19.log"
     
     # Wait for any existing installer to complete before starting
@@ -641,16 +720,16 @@ function Install-OleDbDriver {
         return $false
     }
     
-    Write-Status "Downloading Microsoft OLE DB Driver 19 for SQL Server..." -Type Info
+    Write-Status "Installing Microsoft OLE DB Driver 19 from local folder..." -Type Info
     
     try {
-        # Use TLS 1.2
-        [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12
+        # Verify local installer exists
+        if (-not (Test-Path $localSourcePath)) {
+            Write-Status "ERROR: Local installer not found: $localSourcePath" -Type Error
+            return $false
+        }
         
-        $webClient = New-Object System.Net.WebClient
-        $webClient.DownloadFile($OleDbUrl, $installerPath)
-        
-        Write-Status "Download complete. Installing..." -Type Info
+        Write-Status "Using installer: $installerPath" -Type Info
         
         $attempt = 0
         $installSuccess = $false
@@ -739,30 +818,7 @@ function Install-OleDbDriver {
                     Write-Status "Try manually uninstalling any existing OLE DB Driver 19 from Control Panel, then run this script again." -Type Warning
                     break
                 }
-            } else {
-                Write-Status "Installation failed with exit code: $exitCode" -Type Error
-                Write-Status "Check log file: $logPath" -Type Info
-                # Don't retry for other failures
-                break
-            }
-        }  # End retry loop
-        
-        return $installSuccess
-    }
-    catch {
-        Write-Status "Error: $($_.Exception.Message)" -Type Error
-        return $false
-    }
-    finally {
-        if (Test-Path $installerPath) {
-            Remove-Item $installerPath -Force -ErrorAction SilentlyContinue
-        }
-    }
-}
-
-# ============================================================================
-# MAIN SCRIPT
-# ============================================================================
+            } else {\n                Write-Status \"Installation failed with exit code: $exitCode\" -Type Error\n                Write-Status \"Check log file: $logPath\" -Type Info\n                # Don't retry for other failures\n                break\n            }\n        }  # End retry loop\n        \n        return $installSuccess\n    }\n    catch {\n        Write-Status \"Error: $($_.Exception.Message)\" -Type Error\n        return $false\n    }\n    # Note: Not deleting installer since it's from local installexe folder\n}\n\n# ============================================================================\n# MAIN SCRIPT\n# ============================================================================
 
 Write-Host ""
 Write-Host "============================================================" -ForegroundColor Cyan
@@ -806,6 +862,43 @@ if ($CleanupMsiexec) {
     } else {
         Write-Status "No msiexec processes found." -Type Info
     }
+    Write-Host ""
+}
+
+# ============================================================================
+# VALIDATE LOCAL INSTALLERS
+# ============================================================================
+Write-Host "--- Checking local installer files ---" -ForegroundColor White
+$installerStatus = Test-LocalInstallers
+
+if (-not $installerStatus.Valid) {
+    Write-Status "ERROR: Required installer files are missing!" -Type Error
+    Write-Status "Expected location: $($installerStatus.FolderPath)" -Type Info
+    
+    if (-not $installerStatus.FolderExists) {
+        Write-Status "The 'installexe' folder does not exist next to this script." -Type Error
+    }
+    
+    if ($installerStatus.MissingFiles.Count -gt 0) {
+        Write-Host ""
+        Write-Status "Missing files:" -Type Error
+        foreach ($file in $installerStatus.MissingFiles) {
+            Write-Host "  - $file" -ForegroundColor Red
+        }
+    }
+    
+    Write-Host ""
+    Write-Status "Please download the required files and place them in:" -Type Info
+    Write-Host "  $($installerStatus.FolderPath)" -ForegroundColor Yellow
+    Write-Host ""
+    Write-Status "Download URLs:" -Type Info
+    Write-Host "  vc_redist.x64.exe: https://aka.ms/vc14/vc_redist.x64.exe" -ForegroundColor Cyan
+    Write-Host "  vc_redist.x86.exe: https://aka.ms/vc14/vc_redist.x86.exe" -ForegroundColor Cyan
+    Write-Host "  msoledbsql19.msi:  https://go.microsoft.com/fwlink/?linkid=2318101" -ForegroundColor Cyan
+    Write-Host ""
+    exit 1
+} else {
+    Write-Status "All installer files found in: $($installerStatus.FolderPath)" -Type Success
     Write-Host ""
 }
 
