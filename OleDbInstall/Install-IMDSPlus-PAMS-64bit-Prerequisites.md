@@ -2,7 +2,7 @@
 
 ## Overview
 
-This package installs **Microsoft OLE DB Driver 19 for SQL Server** and its prerequisites on your Windows computer.
+This process will install **Microsoft OLE DB Driver 19 for SQL Server** and its prerequisites on your Windows computer. This is required for the 64-bit version of IMDSPlus/PAMS.
 
 ---
 
@@ -17,7 +17,6 @@ This package installs **Microsoft OLE DB Driver 19 for SQL Server** and its prer
 Before running the installer, ensure:
 - Windows 10 or later (64-bit)
 - Administrator access to the computer
-- All installation files are present in the `installexe` folder
 
 ---
 
@@ -25,9 +24,8 @@ Before running the installer, ensure:
 
 ### Step 1: Run the Installer
 
-1. **Right-click** on `Install-OleDbDriver19.bat`
-2. Select **"Run as administrator"**
-3. If prompted by User Account Control (UAC), click **Yes**
+1. Open IMDSPlus/PAMS Logon.
+2. Go to **Diagnostics → Choose a Diagnostic → Install-OleDbDriver19**
 
 The installer will automatically:
 - Install Visual C++ Redistributable 2015-2022 (x86)
@@ -88,7 +86,6 @@ When running the `msoledbsql19.msi` installer manually:
 
 ### "Access Denied" or "Administrator Required" Error
 - You must run the installer as Administrator
-- Right-click the `.bat` file and select "Run as administrator"
 - **Contact your IT Support team** if you don't have admin access
 
 ### Installation Hangs or Times Out
@@ -97,7 +94,7 @@ When running the `msoledbsql19.msi` installer manually:
 - Restart your computer and try again
 
 ### Components Not Detected After Installation
-- A system restart may be pending
+- A system restart may be required
 - Restart your computer and run the script again to verify
 
 ### Still Having Issues?
@@ -109,8 +106,11 @@ When running the `msoledbsql19.msi` installer manually:
 ## Contact IT Support
 
 If you encounter any issues during installation or do not have administrator privileges, please contact your IT Support team for assistance. Provide them with:
-- The error message (if any)
+- The error message (if any) and a screenshot
 - The log file: `Install-OleDbDriver19.log`
+- The diagnostic output from **View Diagnostic** (copy and paste)
+
+Email all of this information to REJIS IMDSPlus/PAMS support.
 
 ---
 
