@@ -65,6 +65,76 @@ $script:OleDbFile = "msoledbsql19.msi"
 $MinVCRedistVersion = [Version]"14.34.0.0"  # VS 2022 minimum required for MSOLEDBSQL19 (per 19.3.0 release notes)
 $MinOleDbVersion = [Version]"19.0.0.0"
 
+# Timeout configuration (in seconds)
+$script:InstallerTimeoutSeconds = 30  # Development/testing timeout
+# $script:InstallerTimeoutSeconds = 120  # Production timeout (commented out for now)
+
+function Get-ActiveMsiPackageName {
+    <#
+    .SYNOPSIS
+        Tries multiple methods to detect what MSI package is currently being installed
+    .DESCRIPTION
+        Uses registry, temp folder, and event log to identify active MSI installations
+        when command-line extraction fails or returns truncated data
+    .RETURNS
+        MSI filename (e.g., "msoledbsql19.msi") or empty string if not detected
+    #>
+    
+    $detectedMsi = ""
+    
+    # Method 1: Check temp folder for recently accessed .msi files
+    try {
+        $tempPath = $env:TEMP
+        $recentMsis = Get-ChildItem -Path $tempPath -Filter "*.msi" -ErrorAction SilentlyContinue | 
+            Where-Object { 
+                $_.LastAccessTime -gt (Get-Date).AddMinutes(-5) 
+            } | 
+            Sort-Object -Property LastAccessTime -Descending |
+            Select-Object -First 3
+        
+        if ($recentMsis) {
+            Write-Host "    [DEBUG] Recently accessed .msi files in temp:" -ForegroundColor DarkGray
+            foreach ($msi in $recentMsis) {
+                Write-Host "      - $($msi.Name) (accessed $(($_.LastAccessTime | Measure-Object -Property LastAccessTime -Maximum).Maximum))" -ForegroundColor DarkGray
+                if (-not $detectedMsi) { $detectedMsi = $msi.Name }
+            }
+        }
+    } catch {
+        Write-Host "    [DEBUG] Temp folder check error: $($_.Exception.Message)" -ForegroundColor DarkGray
+    }
+    
+    # Method 2: Check registry for Windows Installer active transactions
+    if (-not $detectedMsi) {
+        try {
+            $regPath = "HKLM:\SOFTWARE\Microsoft\Windows\CurrentVersion\Installer\InProgress"
+            if (Test-Path $regPath) {
+                $inProgress = Get-ItemProperty -Path $regPath -ErrorAction SilentlyContinue
+                if ($inProgress -and $inProgress.PSObject.Properties.Count -gt 1) {
+                    Write-Host "    [DEBUG] Registry InProgress keys found: $($inProgress.PSObject.Properties.Count - 1) entries" -ForegroundColor DarkGray
+                    # Try to extract MSI name from registry values
+                    $inProgress.PSObject.Properties | Where-Object { $_.Name -ne "PSPath" -and $_.Name -ne "PSParentPath" -and $_.Name -ne "PSChildName" -and $_.Name -ne "PSDrive" -and $_.Name -ne "PSProvider" } |
+                        ForEach-Object {
+                            Write-Host "      - Key: $($_.Name) Value: $($_.Value)" -ForegroundColor DarkGray
+                        }
+                }
+            }
+        } catch {
+            Write-Host "    [DEBUG] Registry check error: $($_.Exception.Message)" -ForegroundColor DarkGray
+        }
+    }
+    
+    # Method 3: Check for known installer names based on our install files
+    if (-not $detectedMsi) {
+        # If we're running an OLE DB install, likely candidate is msoledbsql19.msi
+        if (Test-Path (Join-Path $script:LocalInstallerPath $script:OleDbFile)) {
+            Write-Host "    [DEBUG] Assuming active installation: $script:OleDbFile (based on local files)" -ForegroundColor DarkGray
+            $detectedMsi = $script:OleDbFile
+        }
+    }
+    
+    return $detectedMsi
+}
+
 function Show-VCRedistDiagnostics {
     <#
     .SYNOPSIS
@@ -211,19 +281,314 @@ function Test-InstallerBusy {
            ($vcRedistProcesses -and $vcRedistProcesses.Count -gt 0)
 }
 
+function Show-InstallerProcesses {
+    <#
+    .SYNOPSIS
+        Displays detailed information about running msiexec and vc_redist processes including what they're installing
+    #>
+    Write-Host ""
+    Write-Host "=== Running Installer Processes ===" -ForegroundColor Yellow
+    
+    $msiProcesses = Get-Process -Name msiexec -ErrorAction SilentlyContinue | 
+        Where-Object { $_.Id -ne $PID }
+    $vcRedistProcesses = Get-Process -Name "vc_redist*" -ErrorAction SilentlyContinue
+    
+    if ($msiProcesses) {
+        Write-Host "msiexec.exe processes (Windows Installer):" -ForegroundColor Cyan
+        foreach ($proc in $msiProcesses) {
+            $runtime = (Get-Date) - $proc.StartTime
+            
+            # Get command line to determine what MSI is being installed
+            $cmdLine = ""
+            $msiFile = ""
+            
+            try {
+                # Try using wmic first with full path (handles longer command lines better than WMI/CIM)
+                $wmicPath = "C:\Windows\System32\wmic.exe"
+                if (Test-Path $wmicPath) {
+                    try {
+                        $wmicOutput = & $wmicPath process where ProcessId=$($proc.Id) get CommandLine /format:list 2>$null
+                        if ($wmicOutput) {
+                            # Parse wmic output which is in "Key=Value" format
+                            $cmdLineMatch = $wmicOutput | Select-String "CommandLine=" | ForEach-Object { $_.Line -replace "CommandLine=", "" }
+                            if ($cmdLineMatch) {
+                                $cmdLine = $cmdLineMatch.Trim()
+                                Write-Host "    [DEBUG] CommandLine (wmic) retrieved: $($cmdLine.Length) chars" -ForegroundColor DarkGray
+                            }
+                        }
+                    } catch {
+                        Write-Host "    [DEBUG] wmic query error: $($_.Exception.Message)" -ForegroundColor DarkGray
+                    }
+                }
+                
+                # Fallback to WMI if wmic didn't work
+                if (-not $cmdLine) {
+                    $wmiProc = Get-CimInstance -ClassName Win32_Process -Filter "ProcessId = $($proc.Id)" -ErrorAction SilentlyContinue
+                    if ($wmiProc -and $wmiProc.CommandLine) {
+                        $cmdLine = $wmiProc.CommandLine
+                        Write-Host "    [DEBUG] CommandLine (CIM) retrieved: $($cmdLine.Length) chars" -ForegroundColor DarkGray
+                    } else {
+                        Write-Host "    [DEBUG] CIM query returned no command line" -ForegroundColor DarkGray
+                    }
+                }
+            } catch {
+                Write-Host "    [DEBUG] Error querying command line: $($_.Exception.Message)" -ForegroundColor DarkGray
+            }
+            
+            # Extract MSI filename from command line with multiple pattern attempts
+            if ($cmdLine) {
+                # Pattern 1: Quoted MSI path (handles "C:\path\file.msi")
+                if ($cmdLine -match '"([^"]*\.msi)"') {
+                    $msiFile = [System.IO.Path]::GetFileName($Matches[1])
+                    Write-Host "    [DEBUG] Pattern 1 (quoted) matched: $msiFile" -ForegroundColor DarkGray
+                } 
+                # Pattern 2: Unquoted MSI path (handles C:\path\file.msi or relative paths)
+                elseif ($cmdLine -match '([^\s"]*\.msi)') {
+                    $msiFile = [System.IO.Path]::GetFileName($Matches[1])
+                    Write-Host "    [DEBUG] Pattern 2 (unquoted) matched: $msiFile" -ForegroundColor DarkGray
+                }
+                # Pattern 3: Look for /i parameter variations
+                elseif ($cmdLine -match '/i\s+["\s]*([^\s"]*\.msi)') {
+                    $msiFile = [System.IO.Path]::GetFileName($Matches[1])
+                    Write-Host "    [DEBUG] Pattern 3 (/i param) matched: $msiFile" -ForegroundColor DarkGray
+                }
+                else {
+                    Write-Host "    [DEBUG] No MSI patterns matched. Full command: $($cmdLine.Substring(0, [Math]::Min(150, $cmdLine.Length)))" -ForegroundColor DarkGray
+                    Write-Host "    [DEBUG] Trying alternative detection methods..." -ForegroundColor DarkGray
+                    # Use alternative detection when command line is truncated
+                    $msiFile = Get-ActiveMsiPackageName
+                }
+            }
+            
+            # If still no MSI detected, try alternative methods as last resort
+            if (-not $msiFile) {
+                Write-Host "    [DEBUG] Trying alternative detection methods..." -ForegroundColor DarkGray
+                $msiFile = Get-ActiveMsiPackageName
+            }
+            
+            Write-Host "  PID: $($proc.Id)" -ForegroundColor White
+            Write-Host "    Process: msiexec.exe" -ForegroundColor White
+            Write-Host "    Started: $($proc.StartTime)" -ForegroundColor Gray
+            Write-Host "    Running for: $([int]$runtime.TotalSeconds) seconds" -ForegroundColor Gray
+            
+            if ($msiFile) {
+                Write-Host "    Installing: $msiFile" -ForegroundColor Yellow
+            } else {
+                Write-Host "    Installing: [Package Info Not Available]" -ForegroundColor Yellow
+            }
+            
+            if ($cmdLine) {
+                # Shorten command line for display
+                $cmdDisplay = if ($cmdLine.Length -gt 120) { "$($cmdLine.Substring(0, 117))..." } else { $cmdLine }
+                Write-Host "    Command: $cmdDisplay" -ForegroundColor DarkGray
+            }
+            
+            Write-Host ""
+        }
+    }
+    
+    if ($vcRedistProcesses) {
+        Write-Host "Visual C++ Redistributable installer processes:" -ForegroundColor Cyan
+        foreach ($proc in $vcRedistProcesses) {
+            $runtime = (Get-Date) - $proc.StartTime
+            
+            # Get command line for vc_redist
+            $cmdLine = ""
+            try {
+                # Try using wmic first with full path (handles longer command lines better than WMI/CIM)
+                $wmicPath = "C:\Windows\System32\wmic.exe"
+                if (Test-Path $wmicPath) {
+                    try {
+                        $wmicOutput = & $wmicPath process where ProcessId=$($proc.Id) get CommandLine /format:list 2>$null
+                        if ($wmicOutput) {
+                            # Parse wmic output which is in "Key=Value" format
+                            $cmdLineMatch = $wmicOutput | Select-String "CommandLine=" | ForEach-Object { $_.Line -replace "CommandLine=", "" }
+                            if ($cmdLineMatch) {
+                                $cmdLine = $cmdLineMatch.Trim()
+                                Write-Host "    [DEBUG] CommandLine (wmic) retrieved: $($cmdLine.Length) chars" -ForegroundColor DarkGray
+                            }
+                        }
+                    } catch {
+                        Write-Host "    [DEBUG] wmic query error: $($_.Exception.Message)" -ForegroundColor DarkGray
+                    }
+                }
+                
+                # Fallback to WMI if wmic didn't work
+                if (-not $cmdLine) {
+                    $wmiProc = Get-CimInstance -ClassName Win32_Process -Filter "ProcessId = $($proc.Id)" -ErrorAction SilentlyContinue
+                    if ($wmiProc -and $wmiProc.CommandLine) {
+                        $cmdLine = $wmiProc.CommandLine
+                        Write-Host "    [DEBUG] CommandLine (CIM) retrieved: $($cmdLine.Length) chars" -ForegroundColor DarkGray
+                    } else {
+                        Write-Host "    [DEBUG] CIM query returned no command line" -ForegroundColor DarkGray
+                    }
+                }
+            } catch {
+                Write-Host "    [DEBUG] Error querying command line: $($_.Exception.Message)" -ForegroundColor DarkGray
+            }
+            
+            # Determine architecture from process name or path
+            $arch = ""
+            if ($proc.ProcessName -like "*x64*" -or $cmdLine -like "*x64*") { 
+                $arch = "x64"
+            } elseif ($proc.ProcessName -like "*x86*" -or $cmdLine -like "*x86*") { 
+                $arch = "x86"
+            } else {
+                # Try to infer from typical vc_redist naming conventions
+                if ($proc.ProcessName -match "vc_redist") {
+                    $arch = "unknown"
+                }
+            }
+            
+            $displayArch = if ($arch) { " ($arch)" } else { "" }
+            
+            Write-Host "  PID: $($proc.Id)" -ForegroundColor White
+            Write-Host "    Process: $($proc.ProcessName)$displayArch" -ForegroundColor White
+            Write-Host "    Started: $($proc.StartTime)" -ForegroundColor Gray
+            Write-Host "    Running for: $([int]$runtime.TotalSeconds) seconds" -ForegroundColor Gray
+            Write-Host "    Installing: Visual C++ 2015-2022 Redistributable" -ForegroundColor Yellow
+            
+            if ($cmdLine) {
+                # Shorten command line for display
+                $cmdDisplay = if ($cmdLine.Length -gt 120) { "$($cmdLine.Substring(0, 117))..." } else { $cmdLine }
+                Write-Host "    Command: $cmdDisplay" -ForegroundColor DarkGray
+            }
+            
+            Write-Host ""
+        }
+    }
+    
+    if (-not $msiProcesses -and -not $vcRedistProcesses) {
+        Write-Host "No installer processes found." -ForegroundColor Gray
+    }
+    
+    Write-Host "=== End Processes ===" -ForegroundColor Yellow
+    Write-Host ""
+}
+
+function Cleanup-ExistingInstallers {
+    <#
+    .SYNOPSIS
+        Proactively cleans up any lingering msiexec or installer processes at script start
+    .DESCRIPTION
+        When doing uninstall/reinstall cycles, old installer processes may remain.
+        This function optionally terminates them before any installation attempts.
+    .RETURNS
+        $true if cleanup successful or no processes found, $false if user aborts
+    #>
+    
+    $msiProcesses = Get-Process -Name msiexec -ErrorAction SilentlyContinue | 
+        Where-Object { $_.Id -ne $PID }
+    $vcRedistProcesses = Get-Process -Name "vc_redist*" -ErrorAction SilentlyContinue
+    
+    if ($msiProcesses -or $vcRedistProcesses) {
+        Write-Host ""
+        Write-Status "Existing installer processes detected:" -Type Warning
+        
+        if ($msiProcesses) {
+            Write-Host "  msiexec.exe processes: $($msiProcesses.Count)" -ForegroundColor Yellow
+            foreach ($proc in $msiProcesses) {
+                $runtime = (Get-Date) - $proc.StartTime
+                Write-Host "    - PID $($proc.Id) running for $([int]$runtime.TotalSeconds) seconds" -ForegroundColor Gray
+            }
+        }
+        
+        if ($vcRedistProcesses) {
+            Write-Host "  Visual C++ Redistributable installers: $($vcRedistProcesses.Count)" -ForegroundColor Yellow
+            foreach ($proc in $vcRedistProcesses) {
+                $runtime = (Get-Date) - $proc.StartTime
+                Write-Host "    - PID $($proc.Id) ($($proc.ProcessName)) running for $([int]$runtime.TotalSeconds) seconds" -ForegroundColor Gray
+            }
+        }
+        
+        Write-Host ""
+        Write-Host "These may be leftover processes from previous uninstall/reinstall cycles." -ForegroundColor Cyan
+        Write-Host "Cleaning them up now will prevent conflicts during installation." -ForegroundColor Cyan
+        Write-Host ""
+        Write-Host "  [Y] Kill these processes and proceed" -ForegroundColor Yellow
+        Write-Host "  [N] Leave them running and proceed (may cause conflicts)" -ForegroundColor Yellow
+        Write-Host "  [Q] Abort script" -ForegroundColor Yellow
+        Write-Host ""
+        
+        $choice = Read-Host "Kill existing installer processes? (Y/N/Q)"
+        Write-Status "User choice: $choice" -Type Info
+        
+        if ($choice -eq "Q" -or $choice -eq "q") {
+            Write-Status "Script aborted by user." -Type Warning
+            exit 0
+        }
+        
+        if ($choice -eq "Y" -or $choice -eq "y") {
+            Write-Status "Terminating existing installer processes..." -Type Warning
+            
+            try {
+                if ($msiProcesses) {
+                    foreach ($proc in $msiProcesses) {
+                        Write-Status "Terminating msiexec PID $($proc.Id)..." -Type Info
+                        $proc | Stop-Process -Force -ErrorAction Stop
+                    }
+                }
+                
+                if ($vcRedistProcesses) {
+                    foreach ($proc in $vcRedistProcesses) {
+                        Write-Status "Terminating $($proc.ProcessName) PID $($proc.Id)..." -Type Info
+                        $proc | Stop-Process -Force -ErrorAction Stop
+                    }
+                }
+                
+                Start-Sleep -Seconds 2
+                
+                # Verify they're gone
+                $msiCheck = Get-Process -Name msiexec -ErrorAction SilentlyContinue | 
+                    Where-Object { $_.Id -ne $PID }
+                $vcCheck = Get-Process -Name "vc_redist*" -ErrorAction SilentlyContinue
+                
+                if ($msiCheck -or $vcCheck) {
+                    Write-Status "WARNING: Some processes still running after termination!" -Type Warning
+                    Write-Status "This may indicate Windows Installer Service is locked." -Type Warning
+                    return $false
+                }
+                
+                Write-Status "Existing installer processes cleaned up successfully." -Type Success
+                Write-Host ""
+                return $true
+            }
+            catch {
+                Write-Status "Error terminating processes: $($_.Exception.Message)" -Type Error
+                Write-Status "Consider running the script with -CleanupMsiexec flag if this persists." -Type Info
+                return $false
+            }
+        } else {
+            Write-Status "Proceeding with existing installer processes running (may cause conflicts)." -Type Warning
+            Write-Host ""
+            return $true
+        }
+    }
+    
+    return $true
+}
+
 function Wait-InstallerFree {
     <#
     .SYNOPSIS
-        Waits for Windows Installer to become available
+        Waits for Windows Installer to become available with user interaction on timeout
     .PARAMETER MaxWaitSeconds
-        Maximum time to wait in seconds (default: 120)
+        Maximum time to wait in seconds (default: uses global script timeout setting)
     .PARAMETER CheckIntervalSeconds
         How often to check in seconds (default: 5)
+    .RETURNS
+        $true if installer is free or user chooses to force-kill and continue
+        $false if user aborts or force-kill fails
     #>
     param(
-        [int]$MaxWaitSeconds = 120,
+        [int]$MaxWaitSeconds = $null,
         [int]$CheckIntervalSeconds = 5
     )
+    
+    # Use script timeout variable if not explicitly provided
+    if ($null -eq $MaxWaitSeconds) {
+        $MaxWaitSeconds = $script:InstallerTimeoutSeconds
+    }
     
     $elapsed = 0
     while ((Test-InstallerBusy) -and ($elapsed -lt $MaxWaitSeconds)) {
@@ -241,7 +606,87 @@ function Wait-InstallerFree {
     
     if (Test-InstallerBusy) {
         Write-Status "Installer is still busy after waiting $MaxWaitSeconds seconds." -Type Warning
-        return $false
+        
+        # Show details about stuck processes
+        Show-InstallerProcesses
+        
+        # Present user with options
+        Write-Host "Choose an action:" -ForegroundColor Yellow
+        Write-Host "  [1] Wait longer (120 more seconds)" -ForegroundColor Cyan
+        Write-Host "  [2] Force terminate stuck processes and continue" -ForegroundColor Cyan
+        Write-Host "  [3] Abort installation" -ForegroundColor Cyan
+        Write-Host ""
+        
+        $choice = Read-Host "Enter your choice (1, 2, or 3)"
+        
+        Write-Status "User choice: $choice" -Type Info
+        
+        switch ($choice) {
+            "1" {
+                Write-Status "Waiting an additional $MaxWaitSeconds seconds..." -Type Info
+                $additionalElapsed = 0
+                while ((Test-InstallerBusy) -and ($additionalElapsed -lt $MaxWaitSeconds)) {
+                    Start-Sleep -Seconds $CheckIntervalSeconds
+                    $additionalElapsed += $CheckIntervalSeconds
+                    Write-Host "." -NoNewline
+                }
+                Write-Host ""
+                
+                if (Test-InstallerBusy) {
+                    Write-Status "Installer still running after additional wait." -Type Warning
+                    return $false
+                } else {
+                    Write-Status "Installer freed after additional wait." -Type Success
+                    return $true
+                }
+            }
+            "2" {
+                Write-Status "Attempting to force-terminate stuck installer processes..." -Type Warning
+                
+                try {
+                    $msiProcesses = Get-Process -Name msiexec -ErrorAction SilentlyContinue | 
+                        Where-Object { $_.Id -ne $PID }
+                    $vcRedistProcesses = Get-Process -Name "vc_redist*" -ErrorAction SilentlyContinue
+                    
+                    if ($msiProcesses) {
+                        foreach ($proc in $msiProcesses) {
+                            Write-Status "Terminating msiexec PID $($proc.Id)..." -Type Warning
+                            $proc | Stop-Process -Force -ErrorAction Stop
+                        }
+                    }
+                    
+                    if ($vcRedistProcesses) {
+                        foreach ($proc in $vcRedistProcesses) {
+                            Write-Status "Terminating $($proc.ProcessName) PID $($proc.Id)..." -Type Warning
+                            $proc | Stop-Process -Force -ErrorAction Stop
+                        }
+                    }
+                    
+                    Start-Sleep -Seconds 2
+                    
+                    if (Test-InstallerBusy) {
+                        Write-Status "WARNING: Processes still running after force termination!" -Type Error
+                        Write-Status "This may indicate Windows Installer Service is locked." -Type Warning
+                        return $false
+                    }
+                    
+                    Write-Status "Stuck processes terminated successfully. Proceeding with installation." -Type Success
+                    return $true
+                }
+                catch {
+                    Write-Status "Error terminating processes: $($_.Exception.Message)" -Type Error
+                    return $false
+                }
+            }
+            "3" {
+                Write-Status "User aborted installation due to stuck installer processes." -Type Warning
+                return $false
+            }
+            default {
+                Write-Status "Invalid choice. Aborting." -Type Error
+                return $false
+            }
+        }
     }
     
     return $true
@@ -614,7 +1059,7 @@ function Install-VCRedist {
     $logPath = Join-Path $DownloadPath "vc_redist_$Architecture.log"
     
     # Wait for any existing installer to complete before starting
-    if (-not (Wait-InstallerFree -MaxWaitSeconds 120)) {
+    if (-not (Wait-InstallerFree)) {
         Write-Status "Cannot proceed while another installer is running. Please close other installers and try again." -Type Error
         return $false
     }
@@ -715,7 +1160,7 @@ function Install-OleDbDriver {
     $logPath = Join-Path $DownloadPath "msoledbsql19.log"
     
     # Wait for any existing installer to complete before starting
-    if (-not (Wait-InstallerFree -MaxWaitSeconds 120)) {
+    if (-not (Wait-InstallerFree)) {
         Write-Status "Cannot proceed while another installer is running. Please close other installers and try again." -Type Error
         return $false
     }
@@ -818,7 +1263,26 @@ function Install-OleDbDriver {
                     Write-Status "Try manually uninstalling any existing OLE DB Driver 19 from Control Panel, then run this script again." -Type Warning
                     break
                 }
-            } else {\n                Write-Status \"Installation failed with exit code: $exitCode\" -Type Error\n                Write-Status \"Check log file: $logPath\" -Type Info\n                # Don't retry for other failures\n                break\n            }\n        }  # End retry loop\n        \n        return $installSuccess\n    }\n    catch {\n        Write-Status \"Error: $($_.Exception.Message)\" -Type Error\n        return $false\n    }\n    # Note: Not deleting installer since it's from local installexe folder\n}\n\n# ============================================================================\n# MAIN SCRIPT\n# ============================================================================
+            } else {
+                Write-Status "Installation failed with exit code: $exitCode" -Type Error
+                Write-Status "Check log file: $logPath" -Type Info
+                # Don't retry for other failures
+                break
+            }
+        }  # End retry loop
+        
+        return $installSuccess
+    }
+    catch {
+        Write-Status "Error: $($_.Exception.Message)" -Type Error
+        return $false
+    }
+    # Note: Not deleting installer since it's from local installexe folder
+}
+
+# ============================================================================
+# MAIN SCRIPT
+# ============================================================================
 
 Write-Host ""
 Write-Host "============================================================" -ForegroundColor Cyan
@@ -832,6 +1296,18 @@ if (-not $isAdmin) {
     Write-Status "This script requires Administrator privileges for installation." -Type Warning
     Write-Status "Currently running in check-only mode." -Type Info
     Write-Host ""
+}
+
+# ============================================================================
+# PROACTIVE CLEANUP OF LEFTOVER INSTALLER PROCESSES
+# ============================================================================
+# If admin and processes exist, offer to clean them up immediately
+# This prevents conflicts from uninstall/reinstall cycles
+if ($isAdmin) {
+    if (-not (Cleanup-ExistingInstallers)) {
+        Write-Status "Could not clean up existing installer processes. Aborting." -Type Error
+        exit 1
+    }
 }
 
 # Show diagnostics if requested
